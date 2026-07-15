@@ -843,6 +843,10 @@ static float g_temp=-1;  /* TEMP: temperatura di sampling sui TOKEN. <0 = auto (
 static float g_nuc=0.95f;/* NUCLEUS: top-p sul vocabolario (default dal generation_config GLM-5.2) */
 static int g_topk=0;     /* TOPK=n -> usa n expert/token invece di config (ricerca: meno disco) */
 static float g_topp=0;   /* TOPP=p (0..1) -> top-p adattivo: tieni gli expert fino a peso cumulato p */
+static int g_hdd_mode=0;
+static double g_auto_latency_target=0.0;
+static double g_ewait_latency=0.0;
+static uint64_t g_ewait_samples=0;
 /* CACHE_ROUTE (paper 2412.00099 max-rank): opt-in only. Keep true top-J always;
  * fill remaining slots preferring pin∪LRU experts ranked within top-M (or mass ROUTE_P). */
 static int g_cache_route=0;
@@ -2016,7 +2020,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         for(int s=0;s<S;s++) for(int h=0;h<H;h++){
             KVState *ks=kvs?kvs[s]:m->kv;
             int pos=positions?positions[s]:pos_base+s;
-            const float *qp=Q+(int64_t)s*H*qh+(int64_t)h*qh;
+            const float *qp=Q+(int64_t)s*H*qh+(int64_t)h*qh;          /* [qk_nope | qk_rope] */
             const float *qr=qp+c->qk_nope;
             int rbase=h*(c->qk_nope+vh);
             float qabs[512]; memset(qabs,0,kvl*sizeof(float));
@@ -2200,6 +2204,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                     idx[chosen]=e; w[chosen]=rank_w[r]; chosen++;
                 }
             }
+            if(g_hdd_mode && g_auto_latency_target > 0 && g_ewait_latency > g_auto_latency_target && chosen > 0) {
+                /* RAM-Aware Fallback: disk is too slow, STOP looking for uncached experts */
+                Ksel = chosen; 
+            }
+
             /* Fill remainder from true ranking order. */
             for(int r=0;r<Mwin && chosen<Ksel;r++){
                 int e=rank_buf[r]; int already=0;
@@ -2249,9 +2258,19 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         } else {
             for(int kk=0;kk<Ksel;kk++){ int best=-1; float bv=-1e30f;
                 for(int e=0;e<E;e++){ int tk=0; for(int j=0;j<kk;j++) if(idx[j]==e){tk=1;break;}
-                    if(!tk && choice[e]>bv){bv=choice[e];best=e;} }
+                    int eligible = 1;
+                    if(g_hdd_mode && g_auto_latency_target > 0 && g_ewait_latency > g_auto_latency_target && kk > 0) {
+                        eligible = expert_is_resident(m,layer,e);
+                    }
+                    if(!tk && eligible && choice[e]>bv){bv=choice[e];best=e;} }
+                if(best<0) break;
                 idx[kk]=best; w[kk]=logit[best];
             }
+            if(g_hdd_mode && g_auto_latency_target > 0 && g_ewait_latency > g_auto_latency_target) {
+                int c_k = 0; for(int kk=0;kk<Ksel;kk++) if(idx[kk]>=0 && w[kk] > -1e20f) c_k++;
+                Ksel = c_k > 0 ? c_k : 1; /* Fallback to 1 if nothing */
+            }
+
             if(g_route_agree){
                 m->route_agree_hit+=(uint64_t)Ksel;
                 m->route_agree_tot+=(uint64_t)Ksel;
@@ -2398,10 +2417,21 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 int eids[64]; for(int q=0;q<nmiss;q++) eids[q]=uniq[base+missk[q]];
                 pipe_dispatch(m,layer,eids,nmiss);
                 m->t_edisk += now_s()-t0;           /* dispatch only; real reads hide behind matmul */
-            } else { double t0=now_s();             /* ORIGINALE: blocking parallel load */
-                #pragma omp parallel for schedule(dynamic,1)
-                for(int q=0;q<nmiss;q++) expert_load(m,layer,uniq[base+missk[q]],&m->ws[q],1);
-                m->t_edisk += now_s()-t0; }
+            } else {
+                double t0=now_s();
+                for(int q=0;q<nmiss;q++){
+                    int e=uniq[base+missk[q]]; ESlot *s=use[missk[q]];
+                    expert_load(m,layer,e,s,0);
+                }
+                double read_ms = (now_s()-t0) * 1000.0;
+                m->t_edisk += read_ms/1000.0;
+                if(g_hdd_mode && nmiss > 0) {
+                    double per_miss = read_ms / nmiss;
+                    if(g_ewait_samples == 0) g_ewait_latency = per_miss;
+                    else g_ewait_latency = g_ewait_latency * 0.8 + per_miss * 0.2;
+                    g_ewait_samples++;
+                }
+            }
         }
         /* I/O ASINCRONO: readahead (WILLNEED) del blocco SUCCESSIVO mentre calcoliamo
          * questo — il kernel legge in background, le pread dopo trovano cache calda */
@@ -4763,6 +4793,9 @@ int main(int argc, char **argv){
     if(g_mmap) fprintf(stderr,"[MMAP] expert = viste zero-copy nei file (page cache = cache)\n");
     g_topk = getenv("TOPK")?atoi(getenv("TOPK")):0;
     g_topp = getenv("TOPP")?atof(getenv("TOPP")):0;
+    g_hdd_mode = getenv("COLI_HDD_MODE")?atoi(getenv("COLI_HDD_MODE")):0;
+    g_auto_latency_target = getenv("AUTO_LATENCY_TARGET_MS")?atof(getenv("AUTO_LATENCY_TARGET_MS")):0.0;
+
     g_cache_route = getenv("CACHE_ROUTE")?atoi(getenv("CACHE_ROUTE")):0;
     g_route_j = getenv("ROUTE_J")?atoi(getenv("ROUTE_J")):2;
     g_route_m = getenv("ROUTE_M")?atoi(getenv("ROUTE_M")):12;

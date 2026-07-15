@@ -159,8 +159,27 @@ def resource_request(a, env):
         [int(value) for value in gpu.split(",")])
     return ram,ctx,devices,vram
 
+def detect_slow_drive(model_path):
+    if os.environ.get("COLI_FORCE_NVME") == "1": return False
+    if os.environ.get("COLI_FORCE_HDD") == "1": return True
+    try:
+        if sys.platform == "win32":
+            out = subprocess.check_output(["powershell", "-NoProfile", "-Command", "Get-PhysicalDisk | Select-Object -ExpandProperty MediaType"], text=True, timeout=2).strip().lower()
+            return "hdd" in out
+        elif sys.platform.startswith("linux"):
+            out = subprocess.check_output(["lsblk", "-ndo", "ROTA", model_path], text=True, timeout=2).strip()
+            return out == "1"
+    except Exception:
+        pass
+    return False
+
 def env_for(a):
     e = dict(os.environ, SNAP=a.model)
+    if detect_slow_drive(a.model):
+        print(f"  {C.org}[AUTO-DETECT] Mechanical HDD detected. Enabling RAM-Aware Fallback Routing.{C.r}", file=sys.stderr)
+        e["COLI_HDD_MODE"] = "1"
+        e["AUTO_LATENCY_TARGET_MS"] = "500"
+
     e["COLI_POLICY"]=a.policy
     if a.ram:  e["RAM_GB"]=str(a.ram)
     if a.ngen: e["NGEN"]=str(a.ngen)

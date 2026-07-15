@@ -58,6 +58,73 @@ def error_object(error):
                       "param": error.param, "code": error.code}}
 
 
+class MemoryManager:
+    def __init__(self):
+        self.base_dir = Path.home() / ".colibri" / "memory"
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+        self.lock = threading.Lock()
+
+    def _get_path(self, user):
+        safe_user = "".join(c for c in str(user) if c.isalnum() or c in "._-")
+        if not safe_user: return None
+        return self.base_dir / f"{safe_user}.txt"
+
+    def search_and_inject(self, user, messages):
+        if not user or not messages: return
+        path = self._get_path(user)
+        if not path or not path.exists(): return
+        
+        last_user_msg = ""
+        for m in reversed(messages):
+            if m.get("role") == "user":
+                content = m.get("content", "")
+                if isinstance(content, str): last_user_msg = content
+                elif isinstance(content, list): last_user_msg = " ".join(p.get("text", "") for p in content if p.get("type") == "text")
+                break
+        
+        if not last_user_msg: return
+        words = [w.strip(".,!?\"'()[]{}:;") for w in last_user_msg.split()]
+        keywords = {w.lower() for w in words if len(w) > 4}
+        if not keywords: return
+
+        matched_lines = []
+        try:
+            with self.lock:
+                lines = path.read_text(encoding="utf-8").splitlines()
+                for line in lines:
+                    line_lower = line.lower()
+                    if any(kw in line_lower for kw in keywords):
+                        matched_lines.append(line)
+        except Exception:
+            return
+
+        if matched_lines:
+            # deduplicate
+            unique = list(dict.fromkeys(matched_lines))
+            # take top 10 matches
+            unique = unique[-10:]
+            injection = "[LONG-TERM MEMORY]\n" + "\n".join(unique) + "\n[/LONG-TERM MEMORY]\n\n"
+            if messages[0].get("role") == "system":
+                messages[0]["content"] = injection + (messages[0].get("content") or "")
+            else:
+                messages.insert(0, {"role": "system", "content": injection})
+
+    def append_journal(self, user, user_msg, assistant_msg):
+        if not user or not user_msg or not assistant_msg: return
+        path = self._get_path(user)
+        if not path: return
+        try:
+            with self.lock:
+                with open(path, "a", encoding="utf-8") as f:
+                    # Clean up newlines for a more compact PDF-like single-line search index
+                    u_clean = user_msg.replace('\n', ' ').strip()
+                    a_clean = assistant_msg.replace('\n', ' ').strip()
+                    f.write(f"User: {u_clean} | Assistant: {a_clean}\n")
+        except Exception:
+            pass
+
+GLOBAL_MEMORY_MANAGER = MemoryManager()
+
 class GenerationScheduler:
     """Bounded FIFO admission for the engine's independent KV contexts."""
 
@@ -826,7 +893,7 @@ class APIHandler(BaseHTTPRequestHandler):
             except OSError:
                 pass
 
-    def generation(self, body, prompt, request_id, chat):
+    def generation(self, body, prompt, request_id, chat, user_id=None, last_user_msg=None):
         # COLI_DEBUG tees the engine transaction to stderr: 1 = decoded output stream only,
         # 2 = both sides (rendered prompt + output). render_chat already folds prior turns and
         # tool results into `prompt`, so level 2 is the full conversation the engine saw.
@@ -880,7 +947,12 @@ class APIHandler(BaseHTTPRequestHandler):
                     choice = ({"index": 0, "message": {"role": "assistant", "content": text,
                                "refusal": None}, "logprobs": None, "finish_reason": length_finish} if chat else
                               {"index": 0, "text": text, "logprobs": None, "finish_reason": length_finish})
+                
+                if user_id and last_user_msg:
+                    GLOBAL_MEMORY_MANAGER.append_journal(user_id, last_user_msg, text)
+                
                 self.send_json(200, {"id": completion_id, "object": object_name, "created": created,
+
                     "model": self.server.model_id, "choices": [choice], "usage": self.usage(stats)},
                     request_id, queue_headers)
                 return
@@ -976,7 +1048,12 @@ class APIHandler(BaseHTTPRequestHandler):
                     lambda: not connected)
                 if not sp["tool"] and sp["buf"]:
                     emit(sp["buf"])                     # no tool call happened: flush held tail
+                
+                if user_id and last_user_msg:
+                    GLOBAL_MEMORY_MANAGER.append_journal(user_id, last_user_msg, "".join(raw))
+                
                 _content, calls = parse_tool_calls("".join(raw), tools)
+
                 for i, tc in enumerate(calls):
                     event([{"index": 0, "delta": {"tool_calls": [{"index": i, "id": tc["id"],
                              "type": "function", "function": {"name": tc["function"]["name"],
@@ -984,14 +1061,19 @@ class APIHandler(BaseHTTPRequestHandler):
                             "logprobs": None, "finish_reason": None}])
                 finish = "tool_calls" if calls else ("length" if stats["length_limited"] else "stop")
             else:
+                raw_text_acc = []
                 def emit_plain(chunk):
+                    raw_text_acc.append(chunk)
                     if dbg_echo:
                         sys.stderr.write(chunk); sys.stderr.flush()
                     emit(chunk)
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, emit_plain, cache_slot,
                     lambda: not connected)
+                if user_id and last_user_msg:
+                    GLOBAL_MEMORY_MANAGER.append_journal(user_id, last_user_msg, "".join(raw_text_acc))
                 finish = "length" if stats["length_limited"] else "stop"
+
             ka_stop.set()                          # generation done: stop the keepalive pump
             ka_thread.join(timeout=2)
             final_choice = ({"index": 0, "delta": {}, "logprobs": None, "finish_reason": finish}
@@ -1000,7 +1082,9 @@ class APIHandler(BaseHTTPRequestHandler):
             event([final_choice])
             if include_usage:
                 event([], self.usage(stats))
+
             if connected:
+
                 try:
                     self.wfile.write(b"data: [DONE]\n\n")
                     self.wfile.flush()
@@ -1041,9 +1125,23 @@ class APIHandler(BaseHTTPRequestHandler):
         if not isinstance(enable_thinking, bool):
             raise APIError(400, "`enable_thinking` must be a boolean.", "enable_thinking")
         tools = body.get("tools") or body.get("functions") or None
-        prompt = render_chat(body.get("messages"), enable_thinking, reasoning_effort, tools,
+        
+        messages = body.get("messages", [])
+        user_id = body.get("user")
+        last_user_msg = ""
+        if user_id:
+            # Capture the last user message to append to the journal later
+            for m in reversed(messages):
+                if m.get("role") == "user":
+                    c = m.get("content", "")
+                    last_user_msg = c if isinstance(c, str) else " ".join(p.get("text", "") for p in c if p.get("type") == "text")
+                    break
+            GLOBAL_MEMORY_MANAGER.search_and_inject(user_id, messages)
+
+        prompt = render_chat(messages, enable_thinking, reasoning_effort, tools,
                              body.get("tool_choice"))
-        self.generation(body, prompt, request_id, True)
+        self.generation(body, prompt, request_id, True, user_id=user_id, last_user_msg=last_user_msg)
+
 
     def completion(self, body, request_id):
         prompt = body.get("prompt")
